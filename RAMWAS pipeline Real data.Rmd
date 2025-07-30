@@ -1,0 +1,195 @@
+
+#Loading package and viewing documentation
+
+library(ramwas) # Loads the package
+#browseVignettes("ramwas") # Opens vignettes
+help(package = "ramwas") # Lists package functions
+
+
+
+dr = paste0("/Volumes/Externito/Ramwas-5-nov")
+
+
+
+#Each RaMWAS step accepts parameters in the form of a list. 
+#Here is the parameter set we will use for all steps below.
+
+param = ramwasParameters(
+  dirproject = dr,
+  dirbam = "Adnel_BAMFILES_08-3-2021",
+  filebamlist = "Bam_list.txt",
+  filecpgset = "cpgset_ALL_hg38_MAF_0.01_chr1-22_bowtie2_75bp.rds",
+  cputhreads = 2,
+  scoretag = "MAPQ",
+  minscore = 4,
+  minfragmentsize = 50,
+  maxfragmentsize = 250,
+  minavgcpgcoverage = 0.3,
+  minnonzerosamples = 0.3,
+  filecovariates = "covariates.txt",
+  modelcovariates = c("PMI", "Race","Smoking","AgeDeath"),
+  modeloutcome = "Dx_Category",
+  modelPCs = 0,
+  toppvthreshold = 1e-4,
+  bihost = "grch37.ensembl.org",
+  bimart = "ENSEMBL_MART_ENSEMBL",
+  bidataset = "hsapiens_gene_ensembl",
+  biattributes = c("hgnc_symbol","strand"),
+  bifilters = list(with_hgnc_trans_name = TRUE),
+  biflank = 0,
+  cvnfolds = 5,
+  mmalpha = 0,
+  mmncpgs = c(5, 10, 50, 100, 500, 1000, 2000)
+)
+
+#Create the following subdirectories in the project directory:
+#qc
+#rds_rbam
+#rds_qc
+Bamscan=ramwas1scanBams(param)
+
+# Saving on object in RData format 
+save(Bamscan, file = "Bamscan_5_NOV.RData") 
+# Save multiple objects 
+#save(data1, data2, file = "data.RData") # To load the data again 
+load("Bamscan_5_NOV.RData")
+
+save(qc, file="test.RData")
+rm(qc)
+load("test.RData")
+
+
+#Create coverage_by_density plot for the simulated data. 
+#It shows higher average CpG score (fragment coverage) for regions with higher CpG densities
+#up to the saturation point.
+
+pfull = parameterPreprocess(param)
+qc = readRDS(paste0(pfull$dirrqc, "/L-5024-BS.qc.rds"))
+plot(qc$qc$avg.coverage.by.density)
+
+
+
+#Summarize QC measures
+
+ramwas2collectqc(param)
+
+#Fragment size distribution estimation plot
+
+
+qc = readRDS(paste0(pfull$dirqc, "/summary_total/qclist.rds"))
+frdata = qc$total$hist.isolated.dist1
+estimate = as.double(readLines(
+  con = paste0(pfull$dirproject,"/Fragment_size_distribution.txt")))
+plotFragmentSizeDistributionEstimate(frdata, estimate)
+
+#Calculate CpG score matrix
+
+ramwas3normalizedCoverage(param)
+
+#Principal component analysis (PCA) on the CpG score matrix.
+
+ramwas4PCA(param)
+
+eigenvalues = fm.load(paste0(pfull$dirpca, "/eigenvalues"));
+eigenvectors = fm.open(
+  filenamebase = paste0(pfull$dirpca, "/eigenvectors"),
+  readonly = TRUE);
+plotPCvalues(eigenvalues)
+
+plotPCvectors(eigenvectors[,1], 1)
+
+plotPCvectors(eigenvectors[,2], 2)
+
+close(eigenvectors)
+
+#Correlations: shows strong correlation of the top PCs with age and sex.
+install.packages('pander')
+
+tblcr = read.table(
+  file = paste0(pfull$dirpca, "/PC_vs_covs_corr.txt"),
+  header = TRUE,
+  sep = "\t")
+
+library(pander)
+pander(head(tblcr, 3))
+
+#p-values indicate statistical significance of these correlations.
+tblpv = read.table(
+  file = paste0(pfull$dirpca, "/PC_vs_covs_pvalue.txt"),
+  header = TRUE,
+  sep = "\t")
+pander(head(tblpv, 3))
+
+#Methylome-wide association study (MWAS)
+#Perform tests for association between normalized CpG scores 
+#and the outcome variable named by modeloutcome parameter. 
+
+ramwas5MWAS(param)
+
+
+#Manhattan plot 
+
+mwas = getMWASandLocations(param)
+layout(matrix(c(1,2), 1, 2, byrow = TRUE), widths=c(1,2.2))
+qqPlotFast(mwas$`p-value`)
+man = manPlotPrepare(
+  pvalues = mwas$`p-value`,
+  chr = mwas$chr,
+  pos = mwas$start,
+  chrmargins = 0)
+manPlotFast(man)
+
+
+#Annotation of top results
+
+ramwas6annotateTopFindings(param)
+
+
+#Methylation risk score
+
+ramwas7riskScoreCV(param)
+
+
+##Methylation risk score prediction using just 50 top CpGs
+
+library(caret)
+cv = readRDS(paste0(pfull$dircv, "/rds/CpGs=000050_alpha=0.000000.rds"))
+
+X <- as.data.frame(cv$X[, 1:50]) 
+Y <- as.factor(cv$outcome)        
+
+df <- cbind(X, Outcome = Y)
+
+ctrl <- trainControl(method = "LOOCV", classProbs = TRUE, summaryFunction = twoClassSummary)
+
+model_loocv <- train(
+  Outcome ~ .,
+  data = df,
+  method = "glm",
+  family = binomial(),
+  trControl = ctrl,
+  metric = "ROC"
+)
+
+results_compare <- data.frame(
+  Sample = rownames(X),
+  TrueLabel = cv$outcome,
+  RaMWAS_Forecast = cv$forecast,
+  Caret_LOOCV_Score = caret_scores
+)
+
+head(results_compare)
+
+plotPrediction(
+  param = pfull,
+  outcome = cv$outcome,
+  forecast = cv$forecast,
+  cpgs2use = 50,
+  main = "Prediction success (EN on coverage)")
+
+##Methylation risk score prediction using just 100 top CpGs
+
+cl = readRDS(sprintf("%s/rds/cor_data_alpha=%f.rds",
+                     pfull$dircv,
+                     pfull$mmalpha))
+plotCVcors(cl, pfull)
